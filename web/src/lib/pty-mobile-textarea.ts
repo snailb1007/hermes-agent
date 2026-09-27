@@ -2,13 +2,9 @@
 // (#122766). The model: the PTY cursor sits at the end of the line, and the
 // textarea caret is kept there too.
 
+import { applyPtyLineEdits, graphemes } from "@/lib/pty-mobile-input";
+
 const DELETE = "\x7f";
-
-const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-
-function graphemes(text: string): string[] {
-  return Array.from(graphemeSegmenter.segment(text), ({ segment }) => segment);
-}
 
 // Bytes that replay a textarea edit onto the PTY line: one DEL per grapheme
 // back to the common prefix, then the retained tail. One IME event can remove
@@ -22,23 +18,6 @@ export function textareaEditBytes(before: string, after: string): string {
     common++;
   }
   return DELETE.repeat(prev.length - common) + next.slice(common).join("");
-}
-
-// The textarea after xterm forwarded `data` itself. xterm cancels the
-// Backspace keydown it turns into DEL, so without this the textarea keeps text
-// the line no longer has and the IME composes against it. After a line
-// boundary or cursor move the textarea cannot model the line: start empty.
-export function textareaAfterTerminalData(value: string, data: string): string {
-  // eslint-disable-next-line no-control-regex -- CR, ^C, ^U, ESC end or move the tracked line
-  if (/[\r\x03\x15\x1b]/.test(data)) {
-    return "";
-  }
-  const deleted = data.split(DELETE).length - 1;
-  if (!deleted) {
-    return value;
-  }
-  const kept = graphemes(value);
-  return kept.slice(0, Math.max(0, kept.length - deleted)).join("");
 }
 
 export interface MobileTextareaBridge {
@@ -79,7 +58,10 @@ export function bridgeMobileTextarea(
   textarea.addEventListener("input", replayDroppedEdit, true);
   return {
     onTerminalData: (data) => {
-      textarea.value = textareaAfterTerminalData(textarea.value, data);
+      // xterm cancels the Backspace keydown it turns into DEL, so without
+      // this the textarea keeps text the line no longer has and the IME
+      // composes against it.
+      textarea.value = applyPtyLineEdits(textarea.value, data, false);
     },
     dispose: () => {
       textarea.removeEventListener("beforeinput", snapshot, true);
