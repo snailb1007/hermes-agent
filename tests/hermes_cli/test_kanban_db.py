@@ -714,6 +714,85 @@ def test_failure_signature_collapses_pid_sha_timestamp_but_not_words(
     assert len(sig("x" * 500)) <= 200
 
 
+def _write_fake_materializer(path):
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "mode = os.environ.get('FAKE_MAT_MODE', 'ok')\n"
+        "if mode == 'ok':\n"
+        "    json.dump({'workspace': os.environ['FAKE_MAT_WS'], 'branch': 'wt/t1'}, sys.stdout)\n"
+        "elif mode == 'infra':\n"
+        "    sys.stderr.write('boom\\norchestration-json: ' + json.dumps("
+        "{'code': 'MERGE_CONFLICT', 'cls': 'infra', 'detail': 'conflict!'}) + '\\n')\n"
+        "    sys.exit(2)\n"
+        "else:\n"
+        "    sys.stderr.write('total garbage failure\\n')\n"
+        "    sys.exit(2)\n",
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o700)
+
+
+def _orchestrated_board(kanban_home, slug="orch"):
+    (kb.boards_root() / slug).mkdir(parents=True, exist_ok=True)
+    (kb.boards_root() / slug / "orchestration.json").write_text("{}", encoding="utf-8")
+    return slug
+
+
+def test_orchestrated_board_delegates_to_materializer(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """Exit 0 → the engine returns exactly the materializer's path."""
+    from types import SimpleNamespace
+
+    slug = _orchestrated_board(kanban_home)
+    fake = tmp_path / "fake-mat.py"
+    _write_fake_materializer(fake)
+    ws = tmp_path / "repo" / ".worktrees" / "t1"
+    ws.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_WORKTREE_MATERIALIZER", str(fake))
+    monkeypatch.setenv("FAKE_MAT_MODE", "ok")
+    monkeypatch.setenv("FAKE_MAT_WS", str(ws))
+    task = SimpleNamespace(id="t1", workspace_path=None, branch_name=None)
+    assert kbw._resolve_worktree_workspace(task, board=slug) == (ws, "wt/t1")
+
+
+def test_orchestrated_board_infra_json_is_typed_preflight_failure(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """Exit 2 with orchestration-json (cls=infra) → typed PreflightFailure."""
+    from types import SimpleNamespace
+
+    slug = _orchestrated_board(kanban_home)
+    fake = tmp_path / "fake-mat.py"
+    _write_fake_materializer(fake)
+    monkeypatch.setenv("HERMES_WORKTREE_MATERIALIZER", str(fake))
+    monkeypatch.setenv("FAKE_MAT_MODE", "infra")
+    task = SimpleNamespace(id="t1", workspace_path=None, branch_name=None)
+    with pytest.raises(kbw.PreflightFailure) as ei:
+        kbw._resolve_worktree_workspace(task, board=slug)
+    assert ei.value.infrastructure is True
+    assert ei.value.code == "MERGE_CONFLICT"
+
+
+def test_orchestrated_board_bare_exit_is_preflight_unavailable(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """Exit 2 with no orchestration-json → PREFLIGHT_UNAVAILABLE (never HEAD)."""
+    from types import SimpleNamespace
+
+    slug = _orchestrated_board(kanban_home)
+    fake = tmp_path / "fake-mat.py"
+    _write_fake_materializer(fake)
+    monkeypatch.setenv("HERMES_WORKTREE_MATERIALIZER", str(fake))
+    monkeypatch.setenv("FAKE_MAT_MODE", "nojson")
+    task = SimpleNamespace(id="t1", workspace_path=None, branch_name=None)
+    with pytest.raises(kbw.PreflightFailure) as ei:
+        kbw._resolve_worktree_workspace(task, board=slug)
+    assert ei.value.code == "PREFLIGHT_UNAVAILABLE"
+    assert ei.value.infrastructure is True
+
+
 def test_card_owned_runtime_error_still_charges_the_card(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):
