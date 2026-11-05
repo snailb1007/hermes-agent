@@ -602,6 +602,139 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
         ).fetchone()[0] == 1
 
 
+def test_preflight_failure_infra_never_charges_card_but_persistent_signature_parks_it(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """Typed preflight refusals classify by exception object through the real
+    dispatch_once boundary: (a) a resolver PreflightFailure with cls='infra'
+    leaves consecutive_failures alone; (b) the 5th consecutive identical infra
+    refusal parks the card with INFRA_PERSISTENT (operator fixes the host);
+    (c) different signatures never trip the ceiling — the card stays retryable."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+
+    orig_resolve = kbw._resolve_worktree_workspace
+
+    def resolve_broken(task, board=None):
+        raise kbw.PreflightFailure("PREFLIGHT_UNAVAILABLE", "infra", "resolver probe exploded")
+
+    def spawn_broken(task, workspace, board=None):
+        raise kbw.PreflightFailure("PREFLIGHT_UNAVAILABLE", "infra", "resolver probe exploded")
+
+    with kbc.connect() as conn:
+        # (a) workspace-resolve path: typed infra, zero budget spent.
+        t_resolve = kb.create_task(conn, title="resolver down", assignee="a", workspace_kind="worktree")
+        monkeypatch.setattr(kbw, "_resolve_worktree_workspace", resolve_broken)
+        res = kbd.dispatch_once(conn, failure_limit=2)
+        assert res.auto_blocked == []
+        row = conn.execute(
+            "SELECT status, consecutive_failures, last_failure_error FROM tasks WHERE id = ?", (t_resolve,),
+        ).fetchone()
+        assert (row["status"], row["consecutive_failures"]) == ("ready", 0)
+        assert "PREFLIGHT_UNAVAILABLE" in row["last_failure_error"]
+        runs = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id = ? ORDER BY id", (t_resolve,),
+        ).fetchall()
+        assert len(runs) >= 1
+        assert [r["outcome"] for r in runs] == ["spawn_failed"] * len(runs)
+        assert all(json.loads(r["metadata"])["infrastructure"] is True for r in runs)
+        monkeypatch.setattr(kbw, "_resolve_worktree_workspace", orig_resolve)
+        kb.block_task(conn, t_resolve, reason="test isolation: keep part (a) card out of later ticks")
+
+        # (b) spawn path: identical infra refusals stay retryable until the 5th
+        # consecutive identical one parks the card. A tick may spawn the same
+        # card more than once, so count failures, not ticks: the park must
+        # happen exactly on the 5th identical failure, never earlier.
+        t_spawn = kb.create_task(conn, title="host down", assignee="a")
+
+        def n_spawn_failed():
+            return conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND outcome = 'spawn_failed'",
+                (t_spawn,),
+            ).fetchone()[0]
+
+        for _ in range(8):
+            res = kbd.dispatch_once(conn, spawn_fn=spawn_broken, failure_limit=10)
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (t_spawn,),
+            ).fetchone()
+            if row["status"] == "blocked":
+                # The 5th consecutive identical failure closes as gave_up, not
+                # spawn_failed: exactly 4 spawn_failed + 1 gave_up. A park with
+                # fewer means the ceiling fired early.
+                assert n_spawn_failed() == 4
+                break
+            assert res.auto_blocked == []
+        else:
+            pytest.fail("identical infra refusals never parked the card")
+        row = conn.execute(
+            "SELECT status, consecutive_failures, last_failure_error FROM tasks WHERE id = ?", (t_spawn,),
+        ).fetchone()
+        assert row["status"] == "blocked"
+        assert row["consecutive_failures"] == 0  # parked, never charged
+        assert row["last_failure_error"].startswith("[INFRA_PERSISTENT]")
+        gave_up = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (t_spawn,),
+        ).fetchone()
+        assert gave_up["outcome"] == "gave_up"
+        assert json.loads(gave_up["metadata"])["persistent"] is True
+
+        # (c) control: five DIFFERENT infra signatures never trip the ceiling.
+        # Cycle so no two consecutive failures share a signature no matter how
+        # many spawns a tick performs; StopIteration must never leak in.
+        import itertools as _it
+
+        t_mixed = kb.create_task(conn, title="flaky host", assignee="a")
+        messages = _it.cycle(["alpha host fault", "beta host fault", "gamma host fault", "delta host fault",
+                              "epsilon host fault"])
+
+        def spawn_flaky(task, workspace, board=None):
+            raise kbw.PreflightFailure("PREFLIGHT_UNAVAILABLE", "infra", next(messages))
+
+        for _ in range(5):
+            res = kbd.dispatch_once(conn, spawn_fn=spawn_flaky, failure_limit=10)
+            assert res.auto_blocked == []
+        row = conn.execute(
+            "SELECT status, consecutive_failures FROM tasks WHERE id = ?", (t_mixed,),
+        ).fetchone()
+        assert (row["status"], row["consecutive_failures"]) == ("ready", 0)
+
+
+def test_failure_signature_collapses_pid_sha_timestamp_but_not_words(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """_failure_signature: same host failure with different PID/SHA/timestamp
+    (or temp path) shares a signature; different words never do."""
+    sig = kbd._failure_signature
+    a = "[PREFLIGHT_UNAVAILABLE] worker pid 12345 sha abcdef1234567 at 2026-11-05T10:00:00 died"
+    b = "[PREFLIGHT_UNAVAILABLE] worker pid 67890 sha 7654321fedcba at 2026-11-06T11:30:00 died"
+    assert sig(a) == sig(b)
+    assert sig("boom in /tmp/worker-123/sock") == sig("boom in /tmp/worker-999/sock")
+    assert sig("alpha host fault") != sig("beta host fault")
+    assert sig("") == "<empty>"
+    assert len(sig("x" * 500)) <= 200
+
+
+def test_card_owned_runtime_error_still_charges_the_card(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """A non-infra RuntimeError (card bug, e.g. HTTP 401 from card code) still
+    spends the card's retry budget and trips the breaker — only typed infra
+    is free."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+
+    def spawn_card_bug(task, workspace, board=None):
+        raise RuntimeError("card code got 401 from api")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="card bug", assignee="a")
+        kbd.dispatch_once(conn, spawn_fn=spawn_card_bug, failure_limit=2)
+        kbd.dispatch_once(conn, spawn_fn=spawn_card_bug, failure_limit=2)
+        row = conn.execute(
+            "SELECT status, consecutive_failures FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert (row["status"], row["consecutive_failures"]) == ("blocked", 2)
+
+
 
 
 

@@ -686,6 +686,28 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+class PreflightFailure(RuntimeError):
+    """A typed workspace-resolution / preflight failure.
+
+    ``cls`` is one of ``infra`` (the host refused: resolver or materializer
+    failed host-side — never spends the card's retry budget), ``compensable``
+    (fix state once, e.g. missing preset) or ``card`` (today's behaviour:
+    the card blocks, an operator reads the detail). ``code`` is a registered
+    key from the orchestration error table (``scripts/orchestration_errors.py``).
+    ``.infrastructure`` is the single predicate the dispatcher classifies on.
+    """
+
+    def __init__(self, code: str, cls: str, detail: str):
+        self.code = code
+        self.cls = cls
+        self.detail = detail
+        super().__init__(f"[{code}] {detail}")
+
+    @property
+    def infrastructure(self) -> bool:
+        return self.cls == "infra"
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -697,7 +719,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         args = ["worktree", "add", str(target), branch_name]
     else:
         args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
-    result = _git(repo_root, *args, timeout=60)
+    result = _git(repo_root, *args, timeout=300)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(

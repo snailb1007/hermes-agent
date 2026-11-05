@@ -1368,6 +1368,26 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     return sweep.crashed
 
 
+_PERSISTENT_INFRA_RUNS = 5
+
+
+def _failure_signature(error: str) -> str:
+    """Host-class signature of a failure: operation verb + host class, never
+    card or task identity. Two consecutive failures share a signature only
+    when the host is failing the same way, so a persistent host fault trips
+    the ceiling while a card that fails differently each time keeps retrying.
+    """
+    first = (error or "").strip().splitlines()
+    text = first[0] if first else ""
+    text = re.sub(r"(?<![a-z0-9])t_[a-z0-9]+", "t_<id>", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?\b", "<ts>", text)
+    text = re.sub(r"/(tmp|var/tmp|var/folders|private/var|private/tmp|dev/shm)(/[\w.\-]+)+", "<tmp>", text)
+    text = re.sub(r"\b[0-9a-f]{7,40}\b", "<sha>", text)
+    text = re.sub(r"\d+", "<n>", text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text[:200] or "<empty>"
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1397,7 +1417,11 @@ def _record_task_failure(
     #114720) — nothing about the card ran, so the run and event are recorded
     with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
     the breaker never trips; the card stays retryable and
-    :func:`check_respawn_guard` spaces the retries.
+    :func:`check_respawn_guard` spaces the retries. Persistent-signature
+    ceiling: the 5th consecutive identical infra refusal (same
+    :func:`_failure_signature`) parks the card as ``blocked`` with an
+    ``[INFRA_PERSISTENT]`` reason and ``persistent: true`` run metadata so an
+    operator fixes the host instead of the dispatcher retrying forever.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1423,7 +1447,36 @@ def _record_task_failure(
         else:
             effective_limit, limit_source = int(failure_limit), "dispatcher"
 
-        if infrastructure or not (force_trip or failures >= effective_limit):
+        # Persistent-signature ceiling: an infra refusal that keeps failing
+        # the SAME way is a broken host, not an unlucky card. When the last
+        # (_PERSISTENT_INFRA_RUNS - 1) runs are spawn_failed with
+        # infrastructure metadata and the same signature as this error, this
+        # (the Nth identical) refusal parks the card with INFRA_PERSISTENT so
+        # an operator fixes the host instead of the dispatcher retrying
+        # forever. A card that fails differently each time never trips this.
+        persistent = False
+        persistent_sig = ""
+        if infrastructure:
+            persistent_sig = _failure_signature(error)
+            prior = conn.execute(
+                "SELECT outcome, metadata, error FROM task_runs "
+                "WHERE task_id = ? AND ended_at IS NOT NULL "
+                "ORDER BY id DESC LIMIT ?",
+                (task_id, _PERSISTENT_INFRA_RUNS - 1),
+            ).fetchall()
+            persistent = len(prior) == _PERSISTENT_INFRA_RUNS - 1 and all(
+                r["outcome"] == "spawn_failed"
+                and _kb._json_dict(r["metadata"]).get("infrastructure") is True
+                and _failure_signature(r["error"] or "") == persistent_sig
+                for r in prior
+            )
+            if persistent:
+                error = (
+                    f"[INFRA_PERSISTENT] {persistent_sig} — same host failure "
+                    f"{_PERSISTENT_INFRA_RUNS} times in a row; fix the host, then unblock"
+                )[:500]
+
+        if (infrastructure and not persistent) or not (force_trip or persistent or failures >= effective_limit):
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
                 conn.execute(
@@ -1468,6 +1521,13 @@ def _record_task_failure(
             "trigger_outcome": outcome,
             "retry_status": retry_status,
         }
+        if persistent:
+            payload["persistent"] = True
+            # Sticky: this trip is independent of consecutive_failures (which
+            # stays 0 — the card never spent budget), so without the marker
+            # recompute_ready would promote the card back to ready next tick
+            # and the dispatcher would retry the dead host forever.
+            payload["sticky"] = True
         run_id = None
         if end_run:
             # Only the spawn path has an open run to close.
@@ -1479,6 +1539,7 @@ def _record_task_failure(
                     "effective_limit": effective_limit,
                     "limit_source": limit_source,
                     "retry_status": retry_status,
+                    **({"persistent": True} if persistent else {}),
                 },
             )
         if force_trip:
@@ -2133,9 +2194,11 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        infrastructure = getattr(exc, "infrastructure", False) is True
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            infrastructure=infrastructure,
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -2164,7 +2227,8 @@ def _dispatch_lane_task(
 
         # The host refused the spawn (no restart-safe scope): nothing about the
         # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+        # Typed preflight refusals (cls == 'infra') classify the same way.
+        infrastructure = isinstance(exc, RestartSafeScopeUnavailable) or getattr(exc, "infrastructure", False) is True
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
         if _record_task_failure(
