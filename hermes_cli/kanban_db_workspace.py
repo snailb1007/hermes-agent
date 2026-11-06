@@ -490,7 +490,7 @@ def _cleanup_worktree_workspace(
             )
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
+        branch = (branch_name or "").strip() or canonical_branch(task_id)
         if branch.startswith("wt/"):
             _git(repo_root, "branch", "-D", branch, timeout=30)
     except Exception:
@@ -735,6 +735,11 @@ def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple
     return target, branch_name
 
 
+def canonical_branch(task_id: str) -> str:
+    """Return the canonical worktree branch name ``wt/<task-id>``."""
+    return f"wt/{task_id}"
+
+
 def _board_is_orchestrated(board_slug: str | None) -> bool:
     """An orchestrated board carries ``orchestration.json`` in its board dir
     (the same ``boards_root()/slug`` layout the engine resolves ``kanban.db``
@@ -760,7 +765,7 @@ def _materialize_via_preflight(materializer: str, board: str, task_id: str) -> t
     if r.returncode == 0:
         try:
             data = json.loads((r.stdout or "").strip())
-            return Path(data["workspace"]), str(data.get("branch") or f"wt/{task_id}")
+            return Path(data["workspace"]), str(data.get("branch") or canonical_branch(task_id))
         except (ValueError, KeyError, TypeError):
             first = ((r.stdout or "").strip().splitlines() or ["materializer printed no evidence JSON"])[0]
             raise PreflightFailure("PREFLIGHT_UNAVAILABLE", "infra", first)
@@ -791,7 +796,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         materializer = os.environ.get("HERMES_WORKTREE_MATERIALIZER") or str(
             Path.home() / ".hermes" / "bin" / "orchestration-preflight")
         return _materialize_via_preflight(materializer, board_slug, task.id)
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    branch_name = (task.branch_name or "").strip() or canonical_branch(task.id)
     if not task.workspace_path:
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
         if not board_default:

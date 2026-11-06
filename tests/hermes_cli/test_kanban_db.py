@@ -814,6 +814,62 @@ def test_card_owned_runtime_error_still_charges_the_card(
         assert (row["status"], row["consecutive_failures"]) == ("blocked", 2)
 
 
+def _project(name="Food Lens", repo="/tmp/foodlens"):
+    from hermes_cli import projects_db as pdb
+    with pdb.connect_closing() as pc:
+        return pdb.get_project(pc, pdb.create_project(pc, name=name, folders=[repo]))
+
+
+def test_orchestrated_project_card_gets_canonical_branch(kanban_home):
+    slug = _orchestrated_board(kanban_home)
+    proj = _project()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="Build X", project_id=proj.slug,
+                             workspace_kind="worktree", board=slug)
+        assert kb.get_task(conn, tid).branch_name == f"wt/{tid}"
+
+
+def test_orchestrated_card_without_project_obj_gets_canonical_branch(kanban_home):
+    slug = _orchestrated_board(kanban_home)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="Build unlinked", project_id="p_missing",
+                             workspace_kind="worktree", board=slug)
+        assert kb.get_task(conn, tid).branch_name == f"wt/{tid}"
+
+
+def test_orchestrated_card_uses_current_board(kanban_home, monkeypatch):
+    slug = _orchestrated_board(kanban_home)
+    monkeypatch.setattr(kb, "get_current_board", lambda: slug)
+    proj = _project()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="Build Y", project_id=proj.slug,
+                             workspace_kind="worktree")
+        assert kb.get_task(conn, tid).branch_name == kb.canonical_branch(tid)
+
+
+def test_orchestrated_card_rejects_explicit_branch(kanban_home):
+    slug = _orchestrated_board(kanban_home)
+    proj = _project()
+    with kbc.connect() as conn:
+        with pytest.raises(ValueError, match="orchestrated board.*omit --branch"):
+            kb.create_task(conn, title="Z", project_id=proj.slug,
+                           workspace_kind="worktree", branch_name="feature/z", board=slug)
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_orchestrated_scratch_unaffected(kanban_home):
+    slug = _orchestrated_board(kanban_home)
+    with kbc.connect() as conn:
+        with pytest.raises(ValueError, match="only valid for worktree"):
+            kb.create_task(conn, title="S", workspace_kind="scratch",
+                           branch_name="x", board=slug)
+
+
+def test_canonical_branch_is_the_materializer_fallback():
+    assert kbw.canonical_branch("t_ab12") == "wt/t_ab12"
+
+
+
 
 
 

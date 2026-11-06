@@ -1099,7 +1099,7 @@ def _project_from_source_task(
     project_slug = None
     if source_task.branch_name:
         prefix, separator, leaf = source_task.branch_name.partition("/")
-        if separator and (leaf == source_task.id or leaf.startswith(f"{source_task.id}-")):
+        if separator and prefix != "wt" and (leaf == source_task.id or leaf.startswith(f"{source_task.id}-")):
             with contextlib.suppress(ValueError):
                 project_slug = _pdb.normalize_slug(prefix)
     if project_slug is None:
@@ -1219,6 +1219,13 @@ def create_task(
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
+    from hermes_cli.kanban_db_workspace import _board_is_orchestrated, canonical_branch
+    orchestrated = workspace_kind == "worktree" and _board_is_orchestrated(board)
+    if orchestrated and branch_name:
+        raise ValueError(
+            f"orchestrated board {board or get_current_board()!r}: "
+            "worktree branch is always wt/<task-id>; omit --branch"
+        )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
@@ -1255,8 +1262,10 @@ def create_task(
                 if project_obj is not None and workspace_kind == "worktree":
                     if project_repo and not workspace_path:
                         workspace_path = os.path.join(project_repo, ".worktrees", task_id)
-                    if not branch_name:
+                    if not orchestrated and not branch_name:
                         branch_name = _project_branch_name(project_obj, task_id, title)
+                if orchestrated:
+                    branch_name = canonical_branch(task_id)
 
                 conn.execute(
                     """
@@ -4215,6 +4224,7 @@ from hermes_cli.kanban_db_workspace import (
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
+    canonical_branch,
 )
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
