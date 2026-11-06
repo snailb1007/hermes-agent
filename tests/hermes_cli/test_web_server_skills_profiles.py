@@ -232,3 +232,51 @@ class TestProfileScopedHubActions:
         # ambient one it would inherit from a selector-less argv.
         env = _web_server_gateway._profile_action_environment(calls[0])
         assert env["HERMES_HOME"] == str(isolated_profiles["default"])
+
+
+class TestNamedProfileSpawnUnderMultiplex:
+    def test_profile_action_environment_binds_target_scope(
+        self, isolated_profiles, monkeypatch
+    ):
+        """A named-profile dashboard spawn must not 500 on a passthrough secret.
+
+        With multiplexing active and no secret scope installed (the dashboard
+        request context), a passthrough-registered name present in the launch
+        process env (e.g. the default profile's RADAR_INGEST_KEY) made
+        ``resolve_passthrough_value`` raise ``UnscopedSecretError`` — every
+        named-profile spawn (skills install/update, MCP install, ...) 500'd
+        with "Failed to install skill: Hermes could not read this profile's ...".
+        The spawn site must bind the TARGET profile's scope while scrubbing, so
+        the child env carries the target's own value and never the launch
+        profile's.
+        """
+        from agent.secret_scope import is_multiplex_active, set_multiplex_active
+        from tools import env_passthrough as _passthrough
+        import tools.environments.local as _local_env
+
+        worker_home = isolated_profiles["worker_alpha"]
+        (worker_home / ".env").write_text(
+            "RADAR_INGEST_KEY=worker-key\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("RADAR_INGEST_KEY", "launch-key")
+        allowed_before = set(_passthrough._get_allowed())
+        _passthrough.register_env_passthrough(["RADAR_INGEST_KEY"])
+        # Incidental PATH-prepend probing reads the checkout-adjacent manifest and
+        # trips the real-home I/O guard in a dev checkout nested under ~/.hermes;
+        # unrelated to the secret-scope behavior pinned here.
+        monkeypatch.setattr(
+            _local_env, "_prepend_hermes_bin_dir", lambda existing_path: existing_path
+        )
+
+        was_active = is_multiplex_active()
+        set_multiplex_active(True)
+        try:
+            env = _web_server_gateway._profile_action_environment(
+                ["-p", "worker_alpha", "skills", "install", "official/demo", "--yes"]
+            )
+        finally:
+            set_multiplex_active(was_active)
+            _passthrough._get_allowed().clear()
+            _passthrough._get_allowed().update(allowed_before)
+        assert env["HERMES_HOME"] == str(worker_home)
+        assert env.get("RADAR_INGEST_KEY") == "worker-key"

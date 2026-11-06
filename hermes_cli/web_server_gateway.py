@@ -396,7 +396,32 @@ def _profile_action_environment(
         from tools.environments.local import build_subprocess_env, strip_launch_profile_env
 
         target_home = _resolve_profile_dir(profile)
-        action_env = build_subprocess_env(base=os.environ, scrub_secrets=True)
+        # Bind the TARGET profile's secret scope while scrubbing: under multiplex a
+        # passthrough-registered name present in the launch process env (e.g. the
+        # default profile's RADAR_INGEST_KEY) makes resolve_passthrough_value raise
+        # UnscopedSecretError with no scope installed, so EVERY named-profile spawn
+        # 500s. The child acts FOR the target profile, so the target principal's
+        # own mapping decides (a miss resolves to None and the key is dropped; the
+        # child reloads its own .env at startup anyway) — never the launch
+        # profile's os.environ. owner_secret_scope is the canonical per-home
+        # helper: the target's files, or frozen launch env + files when the target
+        # IS the process home (env-only launch credentials have no file to
+        # rebuild from and must survive for launch-targeted actions).
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from tui_gateway.launch_profile_policy import owner_secret_scope
+        try:
+            _scope_secrets = owner_secret_scope(target_home)
+        except Exception:
+            _scope_secrets = None
+        _scope_token = (
+            set_secret_scope(_scope_secrets, profile_home=str(target_home))
+            if _scope_secrets is not None else None
+        )
+        try:
+            action_env = build_subprocess_env(base=os.environ, scrub_secrets=True)
+        finally:
+            if _scope_token is not None:
+                reset_secret_scope(_scope_token)
 
         profile_keys = set(_PROFILE_MANAGED_ENV_KEYS)
         try:
